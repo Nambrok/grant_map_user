@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include <xen/gntalloc.h>
 
@@ -59,70 +60,137 @@ int32_t number_page_from_bytes(int32_t len)
     return nb;
 }
 
+
+volatile int cont;
+void sigint_handler(int signum)
+{
+    cont = 0;
+}
+#define WAIT_FOR_USER(var) \
+    do{ \
+        while(var); \
+        var = 1; \
+    }while(0)
+
+#define INIT_WAIT_FOR_USER(var) \
+    do{ \
+        signal(SIGINT, sigint_handler); \
+        var = 1; \
+    }while(0)
+
+#define WAIT_FOR(var) \
+    do { \
+        while(var) sleep(1); \
+    } while(0)
+
+struct ioctl_gntalloc_alloc_gref* alloc_grefs(int gntalloc_fd, uint16_t domid, uint32_t count)
+{
+    int err;
+    struct ioctl_gntalloc_alloc_gref* gref = malloc(sizeof(struct ioctl_gntalloc_alloc_gref));
+    gref->domid = domid; //dom0, but might be something else in the future
+    gref->count = count;
+    gref->flags = GNTALLOC_FLAG_WRITABLE;
+
+    err = ioctl(gntalloc_fd, IOCTL_GNTALLOC_ALLOC_GREF, gref);
+    if(err < 0){
+        free(gref);
+        return NULL;
+    }
+    return gref;
+}
+
+int dealloc_grefs(int gntalloc_fd, struct ioctl_gntalloc_alloc_gref* gref)
+{
+    struct ioctl_gntalloc_dealloc_gref dgref;
+    dgref.index = gref->index;
+    dgref.count = gref->count;
+
+    return ioctl(gntalloc_fd, IOCTL_GNTALLOC_DEALLOC_GREF, &dgref);
+}
+
+char* get_hostname()
+{
+    char* hostname = malloc(sizeof(char) * 255);
+    int fd = open("/etc/hostname", O_RDONLY);
+    read(fd, hostname, 255);
+    //delete the last return line
+    *(strrchr(hostname, '\n')) = '\0';
+    close(fd);
+    return hostname;
+}
+
 int main(int argc, char *argv[])
 {
-    int err, i;
+    int err, i, ret = EXIT_SUCCESS;
     printf("Hello, Xen!\n");
+
+    INIT_WAIT_FOR_USER(cont);
 
     static const uint32_t len = PAGE_SIZE*1;
 
-    /* Alloc the grant reference */
-
+    /* Open access to the gntalloc interface */
     int gntalloc_fd = open_dev_gntalloc();
     if(gntalloc_fd < 0){
         exit(EXIT_FAILURE);
     }
 
-    struct ioctl_gntalloc_alloc_gref gref;
-    gref.domid = 0; //dom0, but might be something else in the future
-    gref.count = number_page_from_bytes(len);
-
-    err = ioctl(gntalloc_fd, IOCTL_GNTALLOC_ALLOC_GREF, &gref);
-    if(err < 0){
+    /* Alloc the grant reference */
+    struct ioctl_gntalloc_alloc_gref* gref = alloc_grefs(gntalloc_fd, 0, number_page_from_bytes(len));
+    if(gref == NULL){
         print_errno();
-        exit(EXIT_FAILURE);
+        ret = EXIT_FAILURE;
+        goto exit_close;
     }
 
-    for(i = 0; i < gref.count; ++i){
-        printf("%d: grefid; %d\n", i, gref.gref_ids[i]);
+    /* We print the obtained grant references */
+    for(i = 0; i < gref->count; ++i){
+        printf("gref[%d]: ref = %d\n", i, gref->gref_ids[i]);
     }
 
     /* Map the grant pages */
-
-    char* shpages = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, gntalloc_fd, gref.index);
+    char* shpages = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, gntalloc_fd, gref->index);
     if(shpages == MAP_FAILED){
         print_error("The mmap-ing failed\n");
         print_errno();
+        ret = EXIT_FAILURE;
+        goto exit_dealloc;
     }
 
-    char* hostname = "TEST1DAMS";
-    char* ret = memcpy(shpages, hostname, strlen(hostname));
-    if(ret != shpages){
+#define NOTIFY_BYTE 4095
+    shpages[NOTIFY_BYTE] = 1;
+
+    /* We put our payload in the shared memory */
+    char* hostname = get_hostname();
+    char* ret1 = memcpy(shpages, hostname, strlen(hostname));
+    if(ret1 != shpages){
         print_error("Return value from memcpy is incorrect");
         exit(EXIT_FAILURE);
     }
+    free(hostname);
 
     printf("%s\n", shpages);
 
-    /* Unmap the grant pages */
+    WAIT_FOR(shpages[NOTIFY_BYTE]);
 
+    /* Unmap the grant pages */
     err = munmap(shpages, len);
     if(err < 0){
         print_errno();
     }
 
+//    printf("Wait for user...\n");
+//    WAIT_FOR_USER(cont);
+//    printf("After interrupt. Cleaning...\n");
+
+exit_dealloc:
     /* Dealloc the grant reference */
-
-    struct ioctl_gntalloc_dealloc_gref dgref;
-    dgref.index = gref.index;
-    dgref.count = gref.count;
-
-    err = ioctl(gntalloc_fd, IOCTL_GNTALLOC_DEALLOC_GREF, &dgref);
+    err = dealloc_grefs(gntalloc_fd, gref);
     if(err < 0){
         print_errno();
-        exit(EXIT_FAILURE);
+        ret = EXIT_FAILURE;
     }
 
+exit_close:
     close(gntalloc_fd);
-    exit(EXIT_SUCCESS);
+    exit(ret);
 }
