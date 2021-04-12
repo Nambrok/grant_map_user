@@ -112,6 +112,12 @@ char* get_hostname()
 {
     char* hostname = malloc(sizeof(char) * 255);
     int fd = open("/etc/hostname", O_RDONLY);
+    if(fd < 0){
+        print_error("File '/etc/hostname' not found\n");
+        free(hostname);
+        return NULL;
+    }
+        
     read(fd, hostname, 255);
     //delete the last return line
     *(strrchr(hostname, '\n')) = '\0';
@@ -126,7 +132,7 @@ int main(int argc, char *argv[])
 
     INIT_WAIT_FOR_USER(cont);
 
-    static const uint32_t len = PAGE_SIZE*1;
+    static const uint32_t len = PAGE_SIZE*2;
 
     /* Open access to the gntalloc interface */
     int gntalloc_fd = open_dev_gntalloc();
@@ -161,6 +167,9 @@ int main(int argc, char *argv[])
 
     /* We put our payload in the shared memory */
     char* hostname = get_hostname();
+    if(hostname == NULL){
+        exit(EXIT_FAILURE);
+    }
     char* ret1 = memcpy(shpages, hostname, strlen(hostname));
     if(ret1 != shpages){
         print_error("Return value from memcpy is incorrect");
@@ -170,7 +179,10 @@ int main(int argc, char *argv[])
 
     printf("%s\n", shpages);
 
-    WAIT_FOR(shpages[NOTIFY_BYTE]);
+//    WAIT_FOR(shpages[NOTIFY_BYTE]);
+
+    WAIT_FOR_USER(cont);
+    printf("After interrupt. Cleaning...\n");
 
     /* Unmap the grant pages */
     err = munmap(shpages, len);
@@ -178,9 +190,6 @@ int main(int argc, char *argv[])
         print_errno();
     }
 
-//    printf("Wait for user...\n");
-//    WAIT_FOR_USER(cont);
-//    printf("After interrupt. Cleaning...\n");
 
 exit_dealloc:
     /* Dealloc the grant reference */
@@ -191,6 +200,7 @@ exit_dealloc:
     }
 
 exit_close:
+    free(gref);
     close(gntalloc_fd);
     exit(ret);
 }

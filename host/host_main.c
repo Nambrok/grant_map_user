@@ -203,7 +203,9 @@ void print_gnttab_copy(struct ioctl_gntdev_grant_copy* gcopy)
     }
 }
 
-int grant_copy(int gntdev_fd, void* buf, domid_t domid, grant_ref_t* refid, int nb_grant)
+
+int grant_copy(int gntdev_fd, void* buf, domid_t domid,
+        grant_ref_t* refid, int nb_grant)
 {
 
     int i, err;
@@ -241,10 +243,89 @@ int grant_copy(int gntdev_fd, void* buf, domid_t domid, grant_ref_t* refid, int 
         struct gntdev_grant_copy_segment* cur = &(seg[i]);
         if(cur->status != GNTST_okay){
             print_error("Error grant copy (gref %d)\n", cur->source.foreign.ref);
+            //Maybe needing to retry ?
+            return -1;
         }
     }
     free(seg);
     return 0;
+}
+
+struct grant_map_ret
+{
+    struct ioctl_gntdev_map_grant_ref* gref;
+    void* buf;
+    int ret;
+};
+
+struct grant_map_ret
+grant_map(int gntdev_fd, domid_t domid, grant_ref_t* refid, int nb_grant)
+{
+
+    int i, nb_pages = number_page_from_grant(nb_grant), err;
+    bool_t verbose = TRUE;
+    struct grant_map_ret ret = {NULL, NULL, 0};
+
+    /* Open access to the grant reference */
+    struct ioctl_gntdev_map_grant_ref* gref =
+        map_grant_ref(gntdev_fd, domid, nb_grant, refid);
+    if(gref == NULL){
+        print_errno();
+        goto exit_gmap;
+    }
+    ret.gref = gref;
+
+    if(verbose){
+        /* We print the opened gref information */
+        printf("count: %d\n", gref->count);
+        for(i = 0; i < gref->count; ++i){
+            struct ioctl_gntdev_grant_ref* ref = &gref->refs[i];
+            printf("gref[%d]: domid = %d, ref = %d\n", i, ref->domid, ref->ref);
+        }
+    }
+
+    /* We set so that when unmap the other side will know */
+    set_unmap_notify(gntdev_fd, gref);
+    if(err < 0){
+        print_errno();
+        print_error("Error while setting unmap notification\n");
+    }
+
+    /* Map the grant pages */
+    void* shbuf = mmap(NULL, nb_pages*PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, gntdev_fd, gref->index);
+    if(shbuf == MAP_FAILED){
+        print_errno();
+        goto exit_mmap;
+    }
+    ret.buf = shbuf;
+
+    return ret;
+
+exit_mmap:
+    free(gref);
+    ret.gref = NULL;
+exit_gmap:
+    ret.ret = EXIT_FAILURE;
+    return ret;
+}
+
+int grant_map_free(int gntdev_fd, int nb_grant, struct grant_map_ret gmap_ret)
+{
+    int ret = EXIT_SUCCESS, err, nb_pages = number_page_from_grant(nb_grant);
+    /* Unmap the grant pages */
+    if((err = munmap(gmap_ret.buf, nb_pages*PAGE_SIZE))){
+        print_errno();
+        print_error("Unmap of the grants has failed\n");
+    }
+
+    /* We close access to the grants */
+    if(unmap_grant_ref(gntdev_fd, gmap_ret.gref)){
+        print_errno();
+        ret = EXIT_FAILURE;
+    }
+
+    free(gmap_ret.gref);
+    return ret;
 }
 
 int main(int argc, char *argv[])
@@ -260,7 +341,7 @@ int main(int argc, char *argv[])
     int gntdev_fd = open_dev_gntdev();
     if(gntdev_fd < 0){
         ret = EXIT_FAILURE;
-        goto exit_all;
+        goto exit_1;
     }
 
     /* Parse the inputs */
@@ -268,7 +349,7 @@ int main(int argc, char *argv[])
     if(nb_grant == 0){
         print_error("The arguments given were incorrect.\n");
         print_error("%s <domid> <grantref> [<grantref> ...]\n", argv[0]);
-        exit(EXIT_FAILURE);
+        goto exit_2;
     }
     //We have one page per grant (page = 4k)
     nb_pages = nb_grant;
@@ -276,72 +357,45 @@ int main(int argc, char *argv[])
     if(!use_copy){
     //Solution where we mmap the other buffer
 
-        /* Open access to the grant reference */
-        struct ioctl_gntdev_map_grant_ref* gref =
-            map_grant_ref(gntdev_fd, domid, nb_grant, refid);
-        if(gref == NULL){
-            print_errno();
-            ret = EXIT_FAILURE;
-            goto exit_free;
+        struct grant_map_ret map_ret = grant_map(gntdev_fd, domid, refid, nb_grant);
+        if(map_ret.ret < 0){
+            print_error("Error while mapping grant references\n");
+            goto exit_3;
         }
-
-        /* We print the opened gref information */
-        printf("count: %d\n", gref->count);
-        for(i = 0; i < gref->count; ++i){
-            struct ioctl_gntdev_grant_ref* ref = &gref->refs[i];
-            printf("gref[%d]: domid = %d, ref = %d\n", i, ref->domid, ref->ref);
-        }
-
-        /* We set so that when unmap the other side will know */
-        set_unmap_notify(gntdev_fd, gref);
-        if(err < 0){
-            print_errno();
-            print_error("Error while setting unmap notification\n");
-        }
-
-        /* Map the grant pages */
-        char *shbuf = mmap(NULL, nb_pages*PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, gntdev_fd, gref->index);
-        if(shbuf == MAP_FAILED){
-            print_errno();
-            ret = EXIT_FAILURE;
-            goto exit_free;
-        }
+        char* shbuf = map_ret.buf;
 
         /* Do the thing with the shared pages */
         printf("%s\n", shbuf);
 
-        /* Unmap the grant pages */
-        if((err = munmap(shbuf, nb_pages*PAGE_SIZE))){
-            print_errno();
-            ret = EXIT_FAILURE;
-            goto exit_free;
-        }
-
-        /* We close access to the grants */
-        if(unmap_grant_ref(gntdev_fd, gref)){
-            print_errno();
-            ret = EXIT_FAILURE;
-        }
-
-        free(gref);
+        grant_map_free(gntdev_fd, nb_grant, map_ret);
 
     } else {
+    //Solution where we grant_copy the buffer
 
-        //Solution where we grant_copy the buffer
         uint32_t len = nb_pages*PAGE_SIZE;
         char* buf = malloc(len);
+        if(buf == NULL){
+            print_errno();
+            ret = EXIT_FAILURE;
+            goto exit_3;
+        }
 
-        grant_copy(gntdev_fd, (void*) buf, domid, refid, nb_grant);
+        err = grant_copy(gntdev_fd, (void*) buf, domid, refid, nb_grant);
+        if(err < 0){
+            print_error("Error with grant copy\n");
+            goto exit_copy;
+        }
 
         printf("%s\n", buf);
 
+exit_copy:
         free(buf);
     }
 
-exit_free:
+exit_3:
     free(refid);
-exit_close:
+exit_2:
     close(gntdev_fd);
-exit_all:
+exit_1:
     exit(ret);
 }
